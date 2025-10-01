@@ -1,0 +1,48 @@
+name: Build AliSniffer dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix: { os: [macos-14, macos-13] }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner & SDK
+        run: |
+          echo "Runner: $(uname -a)"
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          xcrun --sdk iphoneos --show-sdk-version || true
+          ls -la .
+
+      - name: Build with Makefile
+        run: |
+          set -eux
+          make clean || true
+          make
+          ls -l .
+
+      - name: Verify dylib
+        run: |
+          file AliSniffer.dylib
+          otool -L AliSniffer.dylib || true
+
+      - name: Zip artifact
+        run: |
+          mkdir -p dist
+          cp AliSniffer.dylib dist/
+          cd dist && zip -r ../AliSniffer_dylib.zip . && cd ..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AliSniffer_dylib
+          path: AliSniffer_dylib.zip
