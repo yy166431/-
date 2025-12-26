@@ -1,100 +1,233 @@
-//
-// AliSniffer.m  (minimal)
-// 目标：最小可注入 dylib，尽快抓到直播源（m3u8/mpd/ts/mp4/flv/rtmp/ws-flv）。
-// 依赖：Foundation / UIKit / WebKit / AVFoundation
-// 编译：-fobjc-arc，arm64，iOS 11+，动态库
-//
-
+// AliSniffer.m (filtered + toggle UI)
+// 说明：仅用于你们自有页面/自有服务器的调试抓取（NSURLSession/WKWebView/AVPlayer）。
+// 编译：-fobjc-arc，arm64，iOS 11+，dylib
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
 #import <WebKit/WebKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
 
-#pragma mark - 简单上报（含弹窗复制）
+#pragma mark - Config
 
-static void AS_ReportURLAndAlert(NSString *url) {
-    if (!url.length) return;
-    NSLog(@"[AS-Min] Found URL: %@", url);
-    @try {
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFoundURL"
-                                                            object:nil
-                                                          userInfo:@{@"url": url}];
-    } @catch (...) {}
+// 只在这些 host 命中时“自动启用”（你把它改成你们页面域名即可）
+static NSArray<NSString *> *AS_TargetHosts(void) {
+    return @[
+        @"app.kuniunet.com",
+        @"kuniunet.com",
+        // @"your.domain.com",
+    ];
+}
+
+// 是否只抓“媒体相关”URL；你想抓完整请求可关掉（NO）
+static BOOL AS_OnlyMediaURLs = YES;
+
+// 媒体 URL 识别：m3u8/mpd/m4s/ts/mp4/flv/rtmp/ws-flv…（可自行增删）
+static BOOL AS_IsMediaURL(NSString *u) {
+    if (!u.length) return NO;
+    NSRegularExpression *re = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+              @"(?i)(\\.m3u8(\\?|$)|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)"
+                                                      options:0 error:nil];
+        objc_setAssociatedObject([NSObject class], "as_media_re", re, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
+    re = objc_getAssociatedObject([NSObject class], "as_media_re");
+    return [re numberOfMatchesInString:u options:0 range:NSMakeRange(0, u.length)] > 0;
+}
+
+static BOOL AS_HostMatched(NSString *host) {
+    if (!host.length) return NO;
+    for (NSString *h in AS_TargetHosts()) {
+        if ([host isEqualToString:h]) return YES;
+        if ([host hasSuffix:[@"." stringByAppendingString:h]]) return YES;
+    }
+    return NO;
+}
+
+#pragma mark - Runtime Switch
+
+static BOOL gAS_Enabled = NO;
+static BOOL gAS_AutoEnabledByHost = NO;
+
+static void AS_SetEnabled(BOOL en);
+
+#pragma mark - UI (floating button)
+
+@interface ASFloatButton : UIButton
+@end
+@implementation ASFloatButton
+@end
+
+static UIWindow *gAS_OverlayWindow = nil;
+static ASFloatButton *gAS_Button = nil;
+
+static UIViewController *AS_TopVC(void) {
+    UIWindow *key = UIApplication.sharedApplication.keyWindow;
+    UIViewController *vc = key.rootViewController ?: UIApplication.sharedApplication.delegate.window.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+static void AS_ShowToast(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            NSString *title = @"抓到完整请求";
-            NSString *msg   = [NSString stringWithFormat:@"\n%@", url];
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
-                                                                        message:msg
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"复制"
-                                                   style:UIAlertActionStyleDefault
-                                                 handler:^(__unused UIAlertAction *a){
-                UIPasteboard.generalPasteboard.string = url;
-            }]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-
-            UIWindow *win = UIApplication.sharedApplication.keyWindow;
-            UIViewController *vc = win.rootViewController;
-            while (vc.presentedViewController) vc = vc.presentedViewController;
-            if (!vc) vc = [UIApplication sharedApplication].delegate.window.rootViewController;
-            if (vc) {
-                [vc presentViewController:ac animated:YES completion:nil];
-            } else {
-                UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-                w.windowLevel = UIWindowLevelAlert + 1000;
-                UIViewController *tmp = [UIViewController new];
-                w.rootViewController = tmp;
-                [w makeKeyAndVisible];
-                [tmp presentViewController:ac animated:YES completion:nil];
-            }
-        } @catch (...) {}
+        UIViewController *vc = AS_TopVC();
+        if (!vc) return;
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+        lab.text = text ?: @"";
+        lab.numberOfLines = 0;
+        lab.font = [UIFont systemFontOfSize:13];
+        lab.textColor = UIColor.whiteColor;
+        lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
+        lab.layer.cornerRadius = 10;
+        lab.layer.masksToBounds = YES;
+        lab.textAlignment = NSTextAlignmentCenter;
+        [lab sizeToFit];
+        CGFloat pad = 14;
+        lab.frame = CGRectMake(0, 0, lab.bounds.size.width + pad*2, lab.bounds.size.height + pad);
+        lab.center = CGPointMake(vc.view.bounds.size.width/2, vc.view.bounds.size.height*0.15);
+        lab.alpha = 0;
+        [vc.view addSubview:lab];
+        [UIView animateWithDuration:0.2 animations:^{ lab.alpha = 1; } completion:^(__unused BOOL f){
+            [UIView animateWithDuration:0.25 delay:1.2 options:0 animations:^{ lab.alpha = 0; } completion:^(__unused BOOL f2){
+                [lab removeFromSuperview];
+            }];
+        }];
     });
 }
 
-#pragma mark - NSURLSession / NSURLSessionTask
+static void AS_EnsureOverlay(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CGRect r = UIScreen.mainScreen.bounds;
+            gAS_OverlayWindow = [[UIWindow alloc] initWithFrame:r];
+            gAS_OverlayWindow.windowLevel = UIWindowLevelAlert + 2000;
+            gAS_OverlayWindow.backgroundColor = UIColor.clearColor;
 
-static id (*as_orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest *);
-static id as_swz_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
-    id task = as_orig_NSURLSession_dataTaskWithRequest ? as_orig_NSURLSession_dataTaskWithRequest(self, _cmd, request) : nil;
-    if (task && request.URL) {
-        @try { objc_setAssociatedObject(task, "as_task_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC); } @catch(...) {}
-    }
-    return task;
+            UIViewController *vc = [UIViewController new];
+            vc.view.backgroundColor = UIColor.clearColor;
+            gAS_OverlayWindow.rootViewController = vc;
+            [gAS_OverlayWindow makeKeyAndVisible];
+
+            gAS_Button = [ASFloatButton buttonWithType:UIButtonTypeSystem];
+            gAS_Button.frame = CGRectMake(r.size.width - 58, r.size.height * 0.35, 48, 48);
+            gAS_Button.layer.cornerRadius = 24;
+            gAS_Button.layer.masksToBounds = YES;
+            gAS_Button.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+
+            [gAS_Button addTarget:nil action:@selector(as_btnTap) forControlEvents:UIControlEventTouchUpInside];
+
+            UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:nil action:@selector(as_btnLong)];
+            [gAS_Button addGestureRecognizer:lp];
+
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(as_btnPan:)];
+            [gAS_Button addGestureRecognizer:pan];
+
+            [vc.view addSubview:gAS_Button];
+            AS_SetEnabled(NO);
+        });
+    });
 }
 
-static id (*as_orig_NSURLSession_dataTaskWithURL)(id, SEL, NSURL *);
-static id as_swz_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *url) {
-    id task = as_orig_NSURLSession_dataTaskWithURL ? as_orig_NSURLSession_dataTaskWithURL(self, _cmd, url) : nil;
-    if (task && url) {
-        @try {
-            NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
-            objc_setAssociatedObject(task, "as_task_req", r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } @catch(...) {}
-    }
-    return task;
+@interface NSObject (ASButtonActions)
+- (void)as_btnTap;
+- (void)as_btnLong;
+- (void)as_btnPan:(UIPanGestureRecognizer *)g;
+@end
+
+static NSMutableArray<NSString *> *gAS_Captured = nil;
+
+static void AS_PushCaptured(NSString *line) {
+    if (!line.length) return;
+    if (!gAS_Captured) gAS_Captured = [NSMutableArray array];
+    NSString *last = gAS_Captured.lastObject;
+    if ([last isEqualToString:line]) return;
+    [gAS_Captured addObject:line];
+    if (gAS_Captured.count > 200) [gAS_Captured removeObjectAtIndex:0];
 }
 
-static void (*as_orig_NSURLSessionTask_resume)(id, SEL);
-static void as_swz_NSURLSessionTask_resume(id self, SEL _cmd) {
+@implementation NSObject (ASButtonActions)
+- (void)as_btnTap {
+    AS_SetEnabled(!gAS_Enabled);
+    AS_ShowToast(gAS_Enabled ? @"AliSniffer：已启用" : @"AliSniffer：已关闭");
+}
+- (void)as_btnLong {
+    if (!gAS_Captured.count) { AS_ShowToast(@"暂无抓取记录"); return; }
+    NSMutableString *msg = [NSMutableString string];
+    NSInteger start = MAX((NSInteger)gAS_Captured.count - 10, 0);
+    for (NSInteger i = start; i < (NSInteger)gAS_Captured.count; i++) {
+        [msg appendFormat:@"%ld) %@\n\n", (long)(i - start + 1), gAS_Captured[i]];
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = AS_TopVC();
+        if (!vc) return;
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"AliSniffer 抓取记录(最近10条)"
+                                                                    message:msg
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"复制最新" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
+            UIPasteboard.generalPasteboard.string = gAS_Captured.lastObject;
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a){
+            [gAS_Captured removeAllObjects];
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+        [vc presentViewController:ac animated:YES completion:nil];
+    });
+}
+- (void)as_btnPan:(UIPanGestureRecognizer *)g {
+    if (!gAS_Button) return;
+    CGPoint t = [g translationInView:gAS_Button.superview];
+    gAS_Button.center = CGPointMake(gAS_Button.center.x + t.x, gAS_Button.center.y + t.y);
+    [g setTranslation:CGPointZero inView:gAS_Button.superview];
+}
+@end
+
+static void AS_SetEnabled(BOOL en) {
+    gAS_Enabled = en;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gAS_Button) return;
+        gAS_Button.backgroundColor = en ? [[UIColor systemGreenColor] colorWithAlphaComponent:0.85]
+                                        : [[UIColor systemGrayColor] colorWithAlphaComponent:0.75];
+        [gAS_Button setTitle:(en ? @"AS\nON" : @"AS\nOFF") forState:UIControlStateNormal];
+        gAS_Button.titleLabel.numberOfLines = 2;
+        gAS_Button.titleLabel.textAlignment = NSTextAlignmentCenter;
+    });
+}
+
+#pragma mark - Report
+
+static void AS_ReportLine(NSString *line) {
+    if (!line.length) return;
+    NSLog(@"[AliSniffer] %@", line);
+    AS_PushCaptured(line);
     @try {
-        NSURLRequest *r = objc_getAssociatedObject(self, "as_task_req");
-        if (!r && [self respondsToSelector:@selector(currentRequest)]) {
-            @try { r = [self performSelector:@selector(currentRequest)]; } @catch(...) {}
-        }
-        if (r.URL.absoluteString.length) {
-            NSNumber *done = objc_getAssociatedObject(self, "as_task_reported");
-            if (!done || !done.boolValue) {
-                AS_ReportURLAndAlert(r.URL.absoluteString);
-                objc_setAssociatedObject(self, "as_task_reported", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-        }
-    } @catch(...) {}
-    if (as_orig_NSURLSessionTask_resume) as_orig_NSURLSessionTask_resume(self, _cmd);
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFound"
+                                                            object:nil
+                                                          userInfo:@{@"line": line}];
+    } @catch (...) {}
 }
 
-static void as_swizzle(Class c, SEL sel, IMP newImp, IMP *origOut) {
+static NSString *AS_ShortBody(NSData *body) {
+    if (!body.length) return nil;
+    if (body.length > 8 * 1024) return [NSString stringWithFormat:@"<body %lu bytes>", (unsigned long)body.length];
+    NSString *s = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (!s.length) return [NSString stringWithFormat:@"<body %lu bytes>", (unsigned long)body.length];
+    return s;
+}
+
+static BOOL AS_ShouldCaptureRequest(NSURLRequest *r) {
+    if (!gAS_Enabled) return NO;
+    if (!r.URL) return NO;
+    if (!AS_HostMatched(r.URL.host ?: @"")) return NO;
+    NSString *u = r.URL.absoluteString ?: @"";
+    if (AS_OnlyMediaURLs) return AS_IsMediaURL(u);
+    return YES;
+}
+
+#pragma mark - Swizzle helper
+
+static void AS_Swizzle(Class c, SEL sel, IMP newImp, IMP *origOut) {
     if (!c) return;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
@@ -102,139 +235,217 @@ static void as_swizzle(Class c, SEL sel, IMP newImp, IMP *origOut) {
     method_setImplementation(m, newImp);
 }
 
-__attribute__((constructor))
-static void as_install_session_hooks(void) {
+#pragma mark - NSURLSession hooks (request + headers + body)
+
+static id (*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *);
+static id swz_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
+    id task = orig_dataTaskWithRequest ? orig_dataTaskWithRequest(self, _cmd, request) : nil;
+    if (task && request) {
+        @try { objc_setAssociatedObject(task, "as_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC); } @catch(...) {}
+    }
+    return task;
+}
+
+static id (*orig_uploadTaskWithRequest_fromData)(id, SEL, NSURLRequest *, NSData *);
+static id swz_uploadTaskWithRequest_fromData(id self, SEL _cmd, NSURLRequest *request, NSData *data) {
+    id task = orig_uploadTaskWithRequest_fromData ? orig_uploadTaskWithRequest_fromData(self, _cmd, request, data) : nil;
+    if (task && request) {
+        @try {
+            objc_setAssociatedObject(task, "as_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (data) objc_setAssociatedObject(task, "as_body", data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } @catch(...) {}
+    }
+    return task;
+}
+
+static void (*orig_task_resume)(id, SEL);
+static void swz_task_resume(id self, SEL _cmd) {
     @try {
-        Class s = NSClassFromString(@"NSURLSession");
-        if (s) {
-            as_swizzle(s, @selector(dataTaskWithRequest:), (IMP)as_swz_NSURLSession_dataTaskWithRequest, (IMP *)&as_orig_NSURLSession_dataTaskWithRequest);
-            as_swizzle(s, @selector(dataTaskWithURL:),     (IMP)as_swz_NSURLSession_dataTaskWithURL,     (IMP *)&as_orig_NSURLSession_dataTaskWithURL);
+        NSURLRequest *r = objc_getAssociatedObject(self, "as_req");
+        if (!r && [self respondsToSelector:@selector(currentRequest)]) {
+            @try { r = [self performSelector:@selector(currentRequest)]; } @catch(...) {}
         }
-        Class t = NSClassFromString(@"NSURLSessionTask");
-        if (t) {
-            as_swizzle(t, @selector(resume), (IMP)as_swz_NSURLSessionTask_resume, (IMP *)&as_orig_NSURLSessionTask_resume);
+        if (r && AS_ShouldCaptureRequest(r)) {
+            NSData *body = objc_getAssociatedObject(self, "as_body");
+            NSString *method = r.HTTPMethod ?: @"GET";
+            NSDictionary *h = r.allHTTPHeaderFields ?: @{};
+            NSString *b = body ? AS_ShortBody(body) : AS_ShortBody(r.HTTPBody);
+
+            NSString *line = b.length
+                ? [NSString stringWithFormat:@"%@ %@\nHeaders:%@\nBody:%@", method, r.URL.absoluteString, h, b]
+                : [NSString stringWithFormat:@"%@ %@\nHeaders:%@", method, r.URL.absoluteString, h];
+
+            NSNumber *done = objc_getAssociatedObject(self, "as_reported");
+            if (!done.boolValue) {
+                AS_ReportLine(line);
+                objc_setAssociatedObject(self, "as_reported", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
         }
-        NSLog(@"[AS-Min] NSURLSession hooks installed.");
-    } @catch (...) {
-        NSLog(@"[AS-Min] NSURLSession hooks failed.");
+    } @catch(...) {}
+    if (orig_task_resume) orig_task_resume(self, _cmd);
+}
+
+__attribute__((constructor))
+static void AS_InstallSessionHooks(void) {
+    @autoreleasepool {
+        AS_EnsureOverlay();
+
+        Class S = NSClassFromString(@"NSURLSession");
+        if (S) {
+            AS_Swizzle(S, @selector(dataTaskWithRequest:), (IMP)swz_dataTaskWithRequest, (IMP *)&orig_dataTaskWithRequest);
+            AS_Swizzle(S, @selector(uploadTaskWithRequest:fromData:),
+                       (IMP)swz_uploadTaskWithRequest_fromData, (IMP *)&orig_uploadTaskWithRequest_fromData);
+        }
+        Class T = NSClassFromString(@"NSURLSessionTask");
+        if (T) AS_Swizzle(T, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
+
+        NSLog(@"[AliSniffer] NSURLSession hooks installed");
     }
 }
 
-#pragma mark - AVPlayerItem (AccessLog)
+#pragma mark - AVPlayerItem AccessLog (兜底)
 
-static void as_observe_AVItem_once(AVPlayerItem *item) {
+static void AS_ObserveAccessLog(AVPlayerItem *item) {
+    if (!item) return;
     @try {
         [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemNewAccessLogEntryNotification
                                                           object:item
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(__unused NSNotification *note) {
             @try {
+                if (!gAS_Enabled) return;
                 AVPlayerItemAccessLog *log = item.accessLog;
-                if (!log) return;
-                NSArray *events = [log events];
-                if (![events isKindOfClass:[NSArray class]] || events.count == 0) return;
-                id ev = events.lastObject;
+                id ev = log.events.lastObject;
                 NSString *uri = nil;
-                if ([ev respondsToSelector:NSSelectorFromString(@"URI")]) {
-                    uri = [ev valueForKey:@"URI"];
-                }
-                if (uri.length) AS_ReportURLAndAlert(uri);
-            } @catch (...) {}
+                if ([ev respondsToSelector:NSSelectorFromString(@"URI")]) uri = [ev valueForKey:@"URI"];
+                if (uri.length) AS_ReportLine([NSString stringWithFormat:@"AVAccessLog URI: %@", uri]);
+            } @catch(...) {}
         }];
-    } @catch (...) {}
+    } @catch(...) {}
 }
 
-static id (*as_orig_AVPlayerItem_initWithURL)(id, SEL, NSURL *);
-static id as_swz_AVPlayerItem_initWithURL(id self, SEL _cmd, NSURL *URL) {
-    id item = as_orig_AVPlayerItem_initWithURL ? as_orig_AVPlayerItem_initWithURL(self, _cmd, URL) : nil;
-    if (item) as_observe_AVItem_once((AVPlayerItem *)item);
+static id (*orig_item_initWithURL)(id, SEL, NSURL *);
+static id swz_item_initWithURL(id self, SEL _cmd, NSURL *URL) {
+    id item = orig_item_initWithURL ? orig_item_initWithURL(self, _cmd, URL) : nil;
+    if (item) AS_ObserveAccessLog((AVPlayerItem *)item);
     return item;
 }
 
 __attribute__((constructor))
-static void as_install_av_hooks(void) {
-    @try {
-        Class c = NSClassFromString(@"AVPlayerItem");
-        if (c) {
-            Method m = class_getInstanceMethod(c, @selector(initWithURL:));
-            if (m) {
-                as_orig_AVPlayerItem_initWithURL = (void *)method_getImplementation(m);
-                method_setImplementation(m, (IMP)as_swz_AVPlayerItem_initWithURL);
-            }
+static void AS_InstallAVHooks(void) {
+    @autoreleasepool {
+        Class C = NSClassFromString(@"AVPlayerItem");
+        Method m = class_getInstanceMethod(C, @selector(initWithURL:));
+        if (m) {
+            orig_item_initWithURL = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)swz_item_initWithURL);
         }
-        NSLog(@"[AS-Min] AV hooks installed.");
-    } @catch (...) {
-        NSLog(@"[AS-Min] AV hooks failed.");
+        NSLog(@"[AliSniffer] AV hooks installed");
     }
 }
 
-#pragma mark - WKWebView 注入（轻量）
+#pragma mark - WKWebView inject (auto-enable by host + resource sniff)
 
-@interface _AS_WKHandler : NSObject <WKScriptMessageHandler>
+@interface ASWKHandler : NSObject <WKScriptMessageHandler>
 @end
-@implementation _AS_WKHandler
+@implementation ASWKHandler
 - (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
-    if (![m.name isEqualToString:@"_S"]) return;
-    NSString *s = nil;
-    if ([m.body isKindOfClass:NSString.class]) s = (NSString *)m.body;
-    else if ([m.body isKindOfClass:NSURL.class]) s = [(NSURL *)m.body absoluteString];
-    if (s.length) AS_ReportURLAndAlert(s);
+    if (![m.name isEqualToString:@"_AS"]) return;
+    if (![m.body isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *d = (NSDictionary *)m.body;
+    NSString *type = d[@"t"];
+    NSString *url  = d[@"u"];
+    if (!url.length) return;
+
+    if ([type isEqualToString:@"AUTO_ON"]) {
+        // JS 检测到命中 host，也通知原生打开开关（只做一次）
+        if (!gAS_Enabled && !gAS_AutoEnabledByHost) {
+            gAS_AutoEnabledByHost = YES;
+            AS_SetEnabled(YES);
+            AS_ShowToast(@"AliSniffer：已自动启用（命中目标域名）");
+        }
+        return;
+    }
+
+    if (!AS_OnlyMediaURLs || AS_IsMediaURL(url)) {
+        AS_ReportLine([NSString stringWithFormat:@"WK(%@): %@", type ?: @"?", url]);
+    }
 }
 @end
 
-static void as_add_wk_scripts(WKWebViewConfiguration *cfg) {
+static void AS_AddWKScripts(WKWebViewConfiguration *cfg) {
     if (!cfg) return;
     static void *kKey = &kKey;
     if (objc_getAssociatedObject(cfg, kKey)) return;
     objc_setAssociatedObject(cfg, kKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    _AS_WKHandler *h = [_AS_WKHandler new];
-    @try { [cfg.userContentController addScriptMessageHandler:h name:@"_S"]; } @catch (...) {}
+    ASWKHandler *h = [ASWKHandler new];
+    @try { [cfg.userContentController addScriptMessageHandler:h name:@"_AS"]; } @catch (...) {}
 
-    // 轻量 JS：抓 fetch / XHR.open / <video>.src / rtmp/ws-flv 等
     NSString *js =
     @"(function(){try{"
-     "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)"
-     "window.webkit.messageHandlers._S.postMessage('AS_JS_OK');"
-     "function R(u){try{if(u&&/(m3u8|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u))window.webkit.messageHandlers._S.postMessage(u);}catch(e){}}"
-     "if(window.fetch){var _f=window.fetch;window.fetch=function(){var u=arguments[0];try{if(typeof u==='string')R(u);}catch(e){}return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)R(r.url);}catch(e){}return r;});};}"
-     "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{R(u);}catch(e){}return o.apply(this,arguments);};}"
-     "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{R(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
-     "}catch(e){}})();";
+    "function post(t,u){try{window.webkit.messageHandlers._AS.postMessage({t:t,u:String(u||'')});}catch(e){}}"
+    "function host(){try{return location.host||'';}catch(e){return ''}}"
+    "function matchHost(){var h=host();var targets=%@;for(var i=0;i<targets.length;i++){var th=targets[i];if(h===th||h.endsWith('.'+th))return true;}return false;}"
+    "if(matchHost()){post('AUTO_ON','HOST_MATCH:'+host());}"
+    "var _push=history.pushState;history.pushState=function(){var r=_push.apply(this,arguments);try{if(matchHost())post('AUTO_ON','PUSH:'+location.href);}catch(e){}return r;};"
+    "window.addEventListener('popstate',function(){try{if(matchHost())post('AUTO_ON','POP:'+location.href);}catch(e){}});"
+    "if(window.fetch){var _f=window.fetch;window.fetch=function(){try{post('fetch_req',arguments[0]);}catch(e){}"
+      "return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)post('fetch_res',r.url);}catch(e){}return r;});};}"
+    "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{post('xhr_open',u);}catch(e){}return o.apply(this,arguments);};}"
+    "setInterval(function(){try{if(!matchHost())return;var es=performance.getEntriesByType('resource')||[];"
+      "for(var i=Math.max(0,es.length-30);i<es.length;i++){var e=es[i];if(e&&e.name)post('perf',e.name);}"
+    "}catch(e){}},1200);"
+    "}catch(e){}})();";
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:AS_TargetHosts() options:0 error:nil];
+    NSString *targets = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] ?: @"[]";
+    js = [NSString stringWithFormat:js, targets];
 
     WKUserScript *sc = [[WKUserScript alloc] initWithSource:js
-                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                              injectionTime:WKScriptInjectionTimeAtDocumentStart
                                            forMainFrameOnly:NO];
     @try { [cfg.userContentController addUserScript:sc]; } @catch (...) {}
 }
 
-static id (*as_orig_wk_init_frame)(id, SEL, CGRect, WKWebViewConfiguration *);
-static id as_swz_wk_init_frame(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
-    if (cfg) as_add_wk_scripts(cfg);
-    return as_orig_wk_init_frame(self, _cmd, frame, cfg);
+static id (*orig_wk_init_frame)(id, SEL, CGRect, WKWebViewConfiguration *);
+static id swz_wk_init_frame(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *cfg) {
+    if (cfg) AS_AddWKScripts(cfg);
+    return orig_wk_init_frame(self, _cmd, frame, cfg);
 }
 
-static id (*as_orig_wk_init_coder)(id, SEL, NSCoder *);
-static id as_swz_wk_init_coder(id self, SEL _cmd, NSCoder *coder) {
-    WKWebViewConfiguration *cfg = nil;
-    @try { cfg = [coder decodeObjectForKey:@"configuration"]; } @catch (...) {}
-    if (cfg) as_add_wk_scripts(cfg);
-    return as_orig_wk_init_coder(self, _cmd, coder);
+static void (*orig_wk_loadRequest)(id, SEL, NSURLRequest *);
+static void swz_wk_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *req) {
+    @try {
+        if (req.URL && AS_HostMatched(req.URL.host ?: @"")) {
+            if (!gAS_Enabled && !gAS_AutoEnabledByHost) {
+                gAS_AutoEnabledByHost = YES;
+                AS_SetEnabled(YES);
+                AS_ShowToast([NSString stringWithFormat:@"AliSniffer：已在 %@ 自动启用", req.URL.host ?: @"目标域名"]);
+            }
+        }
+    } @catch(...) {}
+    if (orig_wk_loadRequest) orig_wk_loadRequest(self, _cmd, req);
 }
 
 __attribute__((constructor))
-static void as_install_wk_hooks(void) {
-    @try {
-        Class c = NSClassFromString(@"WKWebView");
-        if (!c) return;
-        Method m1 = class_getInstanceMethod(c, @selector(initWithFrame:configuration:));
-        if (m1) { as_orig_wk_init_frame = (void *)method_getImplementation(m1);
-                  method_setImplementation(m1, (IMP)as_swz_wk_init_frame); }
-        Method m2 = class_getInstanceMethod(c, @selector(initWithCoder:));
-        if (m2) { as_orig_wk_init_coder = (void *)method_getImplementation(m2);
-                  method_setImplementation(m2, (IMP)as_swz_wk_init_coder); }
-        NSLog(@"[AS-Min] WK hooks installed.");
-    } @catch (...) {
-        NSLog(@"[AS-Min] WK hooks failed.");
+static void AS_InstallWKHooks(void) {
+    @autoreleasepool {
+        Class C = NSClassFromString(@"WKWebView");
+        if (!C) return;
+
+        Method m1 = class_getInstanceMethod(C, @selector(initWithFrame:configuration:));
+        if (m1) {
+            orig_wk_init_frame = (void *)method_getImplementation(m1);
+            method_setImplementation(m1, (IMP)swz_wk_init_frame);
+        }
+
+        Method m2 = class_getInstanceMethod(C, @selector(loadRequest:));
+        if (m2) {
+            orig_wk_loadRequest = (void *)method_getImplementation(m2);
+            method_setImplementation(m2, (IMP)swz_wk_loadRequest);
+        }
+
+        NSLog(@"[AliSniffer] WK hooks installed");
     }
 }
