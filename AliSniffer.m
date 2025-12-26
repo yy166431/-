@@ -20,7 +20,7 @@ static NSArray<NSString *> *AS_TargetHosts(void) {
     return @[
         @"ced.wtyibxc.cn",
         @"app.kuniunet.com",
-        @"kuniunet.com",
+        @"m.inmuu.com",
         // @"your.domain.com",
     ];
 }
