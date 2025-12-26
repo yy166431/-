@@ -22,11 +22,6 @@ static NSArray<NSString *> *AS_TargetHosts(void) {
 // 是否只抓“媒体相关”URL；想抓完整请求可改成 NO
 static BOOL AS_OnlyMediaURLs = YES;
 
-// 抓到关键 URL 时是否弹窗提示（默认 YES）。太频繁可改 NO
-static BOOL AS_PopupOnCapture = YES;
-// 弹窗最小间隔（秒）
-static NSTimeInterval AS_PopupMinInterval = 1.5;
-
 // 媒体 URL 识别：m3u8/mpd/m4s/ts/mp4/flv/rtmp/ws-flv…（可自行增删）
 static BOOL AS_IsMediaURL(NSString *u) {
     if (!u.length) return NO;
@@ -75,7 +70,7 @@ static void AS_ShowToast(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = AS_TopVC();
         if (!vc) return;
-        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(0,0,0,0)];
         lab.text = text ?: @"";
         lab.numberOfLines = 0;
         lab.font = [UIFont systemFontOfSize:13];
@@ -152,7 +147,7 @@ static void AS_PushCaptured(NSString *line) {
 @implementation NSObject (ASButtonActions)
 - (void)as_btnTap {
     AS_SetEnabled(!gAS_Enabled);
-    AS_ShowToast(gAS_Enabled ? @"AliSniffer：已启用（长按按钮看记录）" : @"AliSniffer：已关闭");
+    AS_ShowToast(gAS_Enabled ? @"AliSniffer：已启用" : @"AliSniffer：已关闭");
 }
 - (void)as_btnLong {
     if (!gAS_Captured.count) { AS_ShowToast(@"暂无抓取记录"); return; }
@@ -181,7 +176,7 @@ static void AS_PushCaptured(NSString *line) {
     if (!gAS_Button) return;
     CGPoint t = [g translationInView:gAS_Button.superview];
     gAS_Button.center = CGPointMake(gAS_Button.center.x + t.x, gAS_Button.center.y + t.y);
-    [g setTranslation:CGPointZero inView:gAS_Button.superview];
+    [g setTranslation:CGPointMake(0,0) inView:gAS_Button.superview];
 }
 @end
 
@@ -208,46 +203,10 @@ static void AS_AutoEnableIfHost(NSString *host, NSString *reason) {
 
 #pragma mark - Report
 
-
-static NSTimeInterval gAS_LastPopupTs = 0;
-
-static void AS_ShowCapturePopup(NSString *line) {
-    if (!AS_PopupOnCapture) return;
-    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    if (now - gAS_LastPopupTs < AS_PopupMinInterval) return;
-    gAS_LastPopupTs = now;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = AS_TopVC();
-        if (!vc) return;
-
-        NSString *msg = line ?: @"";
-        if (msg.length > 900) msg = [[msg substringToIndex:900] stringByAppendingString:@"…"];
-
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"AliSniffer 抓到一条"
-                                                                    message:msg
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
-            UIPasteboard.generalPasteboard.string = line ?: @"";
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-
-        // 避免重复弹窗堆叠
-        if (vc.presentedViewController) {
-            [vc dismissViewControllerAnimated:NO completion:^{
-                [vc presentViewController:ac animated:YES completion:nil];
-            }];
-        } else {
-            [vc presentViewController:ac animated:YES completion:nil];
-        }
-    });
-}
-
 static void AS_ReportLine(NSString *line) {
     if (!line.length) return;
     NSLog(@"[AliSniffer] %@", line);
     AS_PushCaptured(line);
-    AS_ShowCapturePopup(line);
     @try {
         [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFound"
                                                             object:nil
