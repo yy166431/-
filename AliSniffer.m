@@ -56,6 +56,23 @@ static void AS_SetEnabled(BOOL en);
 @interface ASFloatButton : UIButton @end
 @implementation ASFloatButton @end
 
+@interface ASOverlayWindow : UIWindow
+@property (nonatomic, weak) UIView *as_touchView; // only this view receives touches
+@end
+@implementation ASOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // Only let touches land on the floating button; otherwise pass through to WeChat.
+    UIView *v = self.as_touchView;
+    if (!v || v.hidden || v.alpha < 0.01 || !v.userInteractionEnabled) return nil;
+    CGPoint p = [v convertPoint:point fromView:self];
+    if ([v pointInside:p withEvent:event]) {
+        return [v hitTest:p withEvent:event];
+    }
+    return nil;
+}
+@end
+
+
 static UIWindow *gAS_OverlayWindow = nil;
 static ASFloatButton *gAS_Button = nil;
 
@@ -98,14 +115,17 @@ static void AS_EnsureOverlay(void) {
     dispatch_once(&onceToken, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             CGRect r = UIScreen.mainScreen.bounds;
-            gAS_OverlayWindow = [[UIWindow alloc] initWithFrame:r];
+            gAS_OverlayWindow = [[ASOverlayWindow alloc] initWithFrame:r];
             gAS_OverlayWindow.windowLevel = UIWindowLevelAlert + 2000;
             gAS_OverlayWindow.backgroundColor = UIColor.clearColor;
 
             UIViewController *vc = [UIViewController new];
             vc.view.backgroundColor = UIColor.clearColor;
+            vc.view.userInteractionEnabled = YES;
             gAS_OverlayWindow.rootViewController = vc;
-            [gAS_OverlayWindow makeKeyAndVisible];
+            gAS_OverlayWindow.hidden = NO;
+            // 不要抢占 keyWindow，否则微信可能点不动
+            [UIApplication.sharedApplication.keyWindow makeKeyWindow];
 
             gAS_Button = [ASFloatButton buttonWithType:UIButtonTypeSystem];
             gAS_Button.frame = CGRectMake(r.size.width - 58, r.size.height * 0.35, 48, 48);
@@ -122,6 +142,7 @@ static void AS_EnsureOverlay(void) {
             [gAS_Button addGestureRecognizer:pan];
 
             [vc.view addSubview:gAS_Button];
+            ((ASOverlayWindow *)gAS_OverlayWindow).as_touchView = gAS_Button;
             AS_SetEnabled(NO);
         });
     });
