@@ -22,18 +22,17 @@ static NSArray<NSString *> *AS_TargetHosts(void) {
 static BOOL AS_OnlyMediaURLs = YES;
 
 // 媒体 URL 识别：m3u8/mpd/m4s/ts/mp4/flv/rtmp/ws-flv…（可自行增删）
+static NSRegularExpression *gAS_MediaRe = nil;
+static dispatch_once_t gAS_MediaReOnce;
+
 static BOOL AS_IsMediaURL(NSString *u) {
     if (!u.length) return NO;
-    NSRegularExpression *re = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:
-              @"(?i)(\\.m3u8(\\?|$)|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)"
-                                                      options:0 error:nil];
-        objc_setAssociatedObject([NSObject class], "as_media_re", re, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_once(&gAS_MediaReOnce, ^{
+        gAS_MediaRe = [NSRegularExpression regularExpressionWithPattern:
+                       @"(?i)(\.m3u8(\?|$)|\.mpd(\?|$)|\.m4s(\?|$)|\.ts(\?|$)|\.mp4(\?|$)|\.flv(\?|$)|^rtmps?:\/\/|^wss?:\/\/.*\.flv)"
+                                                               options:0 error:nil];
     });
-    re = objc_getAssociatedObject([NSObject class], "as_media_re");
-    return [re numberOfMatchesInString:u options:0 range:NSMakeRange(0, u.length)] > 0;
+    return [gAS_MediaRe numberOfMatchesInString:u options:0 range:NSMakeRange(0, u.length)] > 0;
 }
 
 static BOOL AS_HostMatched(NSString *host) {
@@ -407,7 +406,7 @@ static void AS_AddWKScripts(WKWebViewConfiguration *cfg) {
     js = [NSString stringWithFormat:js, targets];
 
     WKUserScript *sc = [[WKUserScript alloc] initWithSource:js
-                                              injectionTime:WKScriptInjectionTimeAtDocumentStart
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                            forMainFrameOnly:NO];
     @try { [cfg.userContentController addUserScript:sc]; } @catch (...) {}
 }
