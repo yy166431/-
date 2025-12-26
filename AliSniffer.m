@@ -1,5 +1,5 @@
-// AliSniffer.m (fixed build errors + auto-enable on target host)
-// 仅用于你们自有页面/自有服务器的调试抓取（NSURLSession/WKWebView/AVPlayer）。
+// AliSniffer.m (filtered + toggle UI)
+// 说明：仅用于你们自有页面/自有服务器的调试抓取（NSURLSession/WKWebView/AVPlayer）。
 // 编译：-fobjc-arc，arm64，iOS 11+，dylib
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -9,29 +9,30 @@
 
 #pragma mark - Config
 
-// 只在这些 host 命中时“自动启用”（改成你们页面域名即可）
+// 只在这些 host 命中时“自动启用”（你把它改成你们页面域名即可）
 static NSArray<NSString *> *AS_TargetHosts(void) {
     return @[
-        @"ced.wtyibxc.cn",
         @"app.kuniunet.com",
         @"kuniunet.com",
         // @"your.domain.com",
     ];
 }
 
-// 是否只抓“媒体相关”URL；想抓完整请求可改成 NO
+// 是否只抓“媒体相关”URL；你想抓完整请求可关掉（NO）
 static BOOL AS_OnlyMediaURLs = YES;
 
 // 媒体 URL 识别：m3u8/mpd/m4s/ts/mp4/flv/rtmp/ws-flv…（可自行增删）
 static BOOL AS_IsMediaURL(NSString *u) {
     if (!u.length) return NO;
-    static NSRegularExpression *re = nil;
+    NSRegularExpression *re = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         re = [NSRegularExpression regularExpressionWithPattern:
               @"(?i)(\\.m3u8(\\?|$)|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)"
                                                       options:0 error:nil];
+        objc_setAssociatedObject([NSObject class], "as_media_re", re, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     });
+    re = objc_getAssociatedObject([NSObject class], "as_media_re");
     return [re numberOfMatchesInString:u options:0 range:NSMakeRange(0, u.length)] > 0;
 }
 
@@ -53,8 +54,10 @@ static void AS_SetEnabled(BOOL en);
 
 #pragma mark - UI (floating button)
 
-@interface ASFloatButton : UIButton @end
-@implementation ASFloatButton @end
+@interface ASFloatButton : UIButton
+@end
+@implementation ASFloatButton
+@end
 
 static UIWindow *gAS_OverlayWindow = nil;
 static ASFloatButton *gAS_Button = nil;
@@ -97,15 +100,19 @@ static void AS_EnsureOverlay(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
-            CGRect r = UIScreen.mainScreen.bounds;
-            gAS_OverlayWindow = [[UIWindow alloc] initWithFrame:r];
-            gAS_OverlayWindow.windowLevel = UIWindowLevelAlert + 2000;
-            gAS_OverlayWindow.backgroundColor = UIColor.clearColor;
+            // 直接把悬浮按钮加到微信自己的 window 上（不创建新 UIWindow），避免“点不动/抢焦点”
+            UIWindow *w = UIApplication.sharedApplication.keyWindow;
+            if (!w) {
+                // iOS 13+ 可能 keyWindow 为空，取一个可见 window
+                for (UIWindow *win in UIApplication.sharedApplication.windows) {
+                    if (!win.hidden && win.alpha > 0.01) { w = win; break; }
+                }
+            }
+            if (!w) return;
 
-            UIViewController *vc = [UIViewController new];
-            vc.view.backgroundColor = UIColor.clearColor;
-            gAS_OverlayWindow.rootViewController = vc;
-            [gAS_OverlayWindow makeKeyAndVisible];
+            CGRect r = w.bounds;
+
+            gAS_OverlayWindow = w; // 复用，不再新建 window
 
             gAS_Button = [ASFloatButton buttonWithType:UIButtonTypeSystem];
             gAS_Button.frame = CGRectMake(r.size.width - 58, r.size.height * 0.35, 48, 48);
@@ -121,7 +128,7 @@ static void AS_EnsureOverlay(void) {
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(as_btnPan:)];
             [gAS_Button addGestureRecognizer:pan];
 
-            [vc.view addSubview:gAS_Button];
+            [w addSubview:gAS_Button];
             AS_SetEnabled(NO);
         });
     });
@@ -192,15 +199,6 @@ static void AS_SetEnabled(BOOL en) {
     });
 }
 
-static void AS_AutoEnableIfHost(NSString *host, NSString *reason) {
-    if (!host.length) return;
-    if (!AS_HostMatched(host)) return;
-    if (gAS_Enabled || gAS_AutoEnabledByHost) return;
-    gAS_AutoEnabledByHost = YES;
-    AS_SetEnabled(YES);
-    AS_ShowToast([NSString stringWithFormat:@"AliSniffer：已自动启用（%@）", reason ?: host]);
-}
-
 #pragma mark - Report
 
 static void AS_ReportLine(NSString *line) {
@@ -241,12 +239,11 @@ static void AS_Swizzle(Class c, SEL sel, IMP newImp, IMP *origOut) {
     method_setImplementation(m, newImp);
 }
 
-#pragma mark - NSURLSession hooks
+#pragma mark - NSURLSession hooks (request + headers + body)
 
 static id (*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *);
 static id swz_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
     id task = orig_dataTaskWithRequest ? orig_dataTaskWithRequest(self, _cmd, request) : nil;
-    if (request.URL.host.length) AS_AutoEnableIfHost(request.URL.host, @"NSURLSession");
     if (task && request) {
         @try { objc_setAssociatedObject(task, "as_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC); } @catch(...) {}
     }
@@ -256,7 +253,6 @@ static id swz_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
 static id (*orig_uploadTaskWithRequest_fromData)(id, SEL, NSURLRequest *, NSData *);
 static id swz_uploadTaskWithRequest_fromData(id self, SEL _cmd, NSURLRequest *request, NSData *data) {
     id task = orig_uploadTaskWithRequest_fromData ? orig_uploadTaskWithRequest_fromData(self, _cmd, request, data) : nil;
-    if (request.URL.host.length) AS_AutoEnableIfHost(request.URL.host, @"NSURLSession");
     if (task && request) {
         @try {
             objc_setAssociatedObject(task, "as_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -334,7 +330,6 @@ static void AS_ObserveAccessLog(AVPlayerItem *item) {
 
 static id (*orig_item_initWithURL)(id, SEL, NSURL *);
 static id swz_item_initWithURL(id self, SEL _cmd, NSURL *URL) {
-    if (URL.host.length) AS_AutoEnableIfHost(URL.host, @"AVPlayerItem");
     id item = orig_item_initWithURL ? orig_item_initWithURL(self, _cmd, URL) : nil;
     if (item) AS_ObserveAccessLog((AVPlayerItem *)item);
     return item;
@@ -353,9 +348,10 @@ static void AS_InstallAVHooks(void) {
     }
 }
 
-#pragma mark - WKWebView inject (auto-enable + resource sniff)
+#pragma mark - WKWebView inject (auto-enable by host + resource sniff)
 
-@interface ASWKHandler : NSObject <WKScriptMessageHandler> @end
+@interface ASWKHandler : NSObject <WKScriptMessageHandler>
+@end
 @implementation ASWKHandler
 - (void)userContentController:(WKUserContentController *)uc didReceiveScriptMessage:(WKScriptMessage *)m {
     if (![m.name isEqualToString:@"_AS"]) return;
@@ -365,7 +361,16 @@ static void AS_InstallAVHooks(void) {
     NSString *url  = d[@"u"];
     if (!url.length) return;
 
-    // 资源抓取
+    if ([type isEqualToString:@"AUTO_ON"]) {
+        // JS 检测到命中 host，也通知原生打开开关（只做一次）
+        if (!gAS_Enabled && !gAS_AutoEnabledByHost) {
+            gAS_AutoEnabledByHost = YES;
+            AS_SetEnabled(YES);
+            AS_ShowToast(@"AliSniffer：已自动启用（命中目标域名）");
+        }
+        return;
+    }
+
     if (!AS_OnlyMediaURLs || AS_IsMediaURL(url)) {
         AS_ReportLine([NSString stringWithFormat:@"WK(%@): %@", type ?: @"?", url]);
     }
@@ -381,28 +386,28 @@ static void AS_AddWKScripts(WKWebViewConfiguration *cfg) {
     ASWKHandler *h = [ASWKHandler new];
     @try { [cfg.userContentController addScriptMessageHandler:h name:@"_AS"]; } @catch (...) {}
 
+    NSString *js =
+    @"(function(){try{"
+    "function post(t,u){try{window.webkit.messageHandlers._AS.postMessage({t:t,u:String(u||'')});}catch(e){}}"
+    "function host(){try{return location.host||'';}catch(e){return ''}}"
+    "function matchHost(){var h=host();var targets=%@;for(var i=0;i<targets.length;i++){var th=targets[i];if(h===th||h.endsWith('.'+th))return true;}return false;}"
+    "if(matchHost()){post('AUTO_ON','HOST_MATCH:'+host());}"
+    "var _push=history.pushState;history.pushState=function(){var r=_push.apply(this,arguments);try{if(matchHost())post('AUTO_ON','PUSH:'+location.href);}catch(e){}return r;};"
+    "window.addEventListener('popstate',function(){try{if(matchHost())post('AUTO_ON','POP:'+location.href);}catch(e){}});"
+    "if(window.fetch){var _f=window.fetch;window.fetch=function(){try{post('fetch_req',arguments[0]);}catch(e){}"
+      "return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)post('fetch_res',r.url);}catch(e){}return r;});};}"
+    "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{post('xhr_open',u);}catch(e){}return o.apply(this,arguments);};}"
+    "setInterval(function(){try{if(!matchHost())return;var es=performance.getEntriesByType('resource')||[];"
+      "for(var i=Math.max(0,es.length-30);i<es.length;i++){var e=es[i];if(e&&e.name)post('perf',e.name);}"
+    "}catch(e){}},1200);"
+    "}catch(e){}})();";
+
     NSData *json = [NSJSONSerialization dataWithJSONObject:AS_TargetHosts() options:0 error:nil];
     NSString *targets = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] ?: @"[]";
-
-    NSString *js =
-    [NSString stringWithFormat:
-     @"(function(){try{"
-      "function post(t,u){try{window.webkit.messageHandlers._AS.postMessage({t:t,u:String(u||'')});}catch(e){}}"
-      "function host(){try{return location.host||'';}catch(e){return ''}}"
-      "function matchHost(){var h=host();var targets=%@;for(var i=0;i<targets.length;i++){var th=targets[i];if(h===th||h.endsWith('.'+th))return true;}return false;}"
-      "if(matchHost()) { post('host', location.href); }"
-      "var _push=history.pushState;history.pushState=function(){var r=_push.apply(this,arguments);try{if(matchHost())post('nav',location.href);}catch(e){}return r;};"
-      "window.addEventListener('popstate',function(){try{if(matchHost())post('nav',location.href);}catch(e){}});"
-      "if(window.fetch){var _f=window.fetch;window.fetch=function(){try{post('fetch_req',arguments[0]);}catch(e){}"
-        "return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)post('fetch_res',r.url);}catch(e){}return r;});};}"
-      "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{post('xhr_open',u);}catch(e){}return o.apply(this,arguments);};}"
-      "setInterval(function(){try{if(!matchHost())return;var es=performance.getEntriesByType('resource')||[];"
-        "for(var i=Math.max(0,es.length-30);i<es.length;i++){var e=es[i];if(e&&e.name)post('perf',e.name);}"
-      "}catch(e){}},1200);"
-     "}catch(e){}})();", targets];
+    js = [NSString stringWithFormat:js, targets];
 
     WKUserScript *sc = [[WKUserScript alloc] initWithSource:js
-                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                              injectionTime:WKScriptInjectionTimeAtDocumentStart
                                            forMainFrameOnly:NO];
     @try { [cfg.userContentController addUserScript:sc]; } @catch (...) {}
 }
@@ -416,7 +421,13 @@ static id swz_wk_init_frame(id self, SEL _cmd, CGRect frame, WKWebViewConfigurat
 static void (*orig_wk_loadRequest)(id, SEL, NSURLRequest *);
 static void swz_wk_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *req) {
     @try {
-        if (req.URL.host.length) AS_AutoEnableIfHost(req.URL.host, @"WKWebView");
+        if (req.URL && AS_HostMatched(req.URL.host ?: @"")) {
+            if (!gAS_Enabled && !gAS_AutoEnabledByHost) {
+                gAS_AutoEnabledByHost = YES;
+                AS_SetEnabled(YES);
+                AS_ShowToast([NSString stringWithFormat:@"AliSniffer：已在 %@ 自动启用", req.URL.host ?: @"目标域名"]);
+            }
+        }
     } @catch(...) {}
     if (orig_wk_loadRequest) orig_wk_loadRequest(self, _cmd, req);
 }
