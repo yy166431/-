@@ -25,8 +25,8 @@ static NSArray<NSString *> *AS_TargetHosts(void) {
     ];
 }
 
-// 默认建议：只抓媒体 URL（m3u8/flv/rtmp…）
-// 你在调试时可以改成 NO（会弹很多“接口 JSON”）
+// 你当前需要看更多：NO 会把“接口”也抓出来（但我们仍然只在进入目标页面后才开始抓）
+// 注意：媒体 URL 会不限制 host（防止 CDN 漏抓）
 static BOOL AS_OnlyMediaURLs = NO;
 
 // 弹窗：1=命中时弹窗+复制；0=完全静默（只上报服务器+NSLog）
@@ -45,19 +45,40 @@ static BOOL AS_IsPushURL(NSURL *u) {
     if (!u) return NO;
     NSString *s = u.absoluteString ?: @"";
     if ([s hasPrefix:kPushRawEndpoint] || [s hasPrefix:kPushFormEndpoint]) return YES;
-    // 也可按 host 排除
     if ([u.host isEqualToString:@"139.155.57.242"]) return YES;
     return NO;
 }
 
+/**
+ 你原来这样写是不对的：
+   "\\key"、"\\auth" 会被当成“转义序列”，并且正则里也不是你想要的含义。
+ 正确写法：
+   - 如果想匹配单词 key/auth：直接写 "key" / "auth"
+   - 如果想匹配查询参数：写 "[?&]key=" / "[?&]auth_key=" 这类
+*/
 static BOOL AS_IsMediaURL(NSString *u) {
     if (!u.length) return NO;
     static NSRegularExpression *re = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:
-              @"(?i)(\\.m3u8(\\?|$)|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)"
-                                                      options:0 error:nil];
+        // 规则：
+        // 1) 常见媒体扩展名：m3u8/ts/m4s/mpd/mp4/flv
+        // 2) 直播常见鉴权参数：auth/auth_key/key/token/sign/expires 等（只要 URL 里带这些就视为“关键”）
+        // 3) rtmp / ws flv
+        NSString *pat =
+        @"(?i)("
+          "\\.m3u8(\\?|$)|"
+          "\\.mpd(\\?|$)|"
+          "\\.m4s(\\?|$)|"
+          "\\.ts(\\?|$)|"
+          "\\.mp4(\\?|$)|"
+          "\\.flv(\\?|$)|"
+          "[?&](auth_key|auth|key|token|sign|signature|expires|expire|st|wsSecret|wsTime|authKey|authkey)=|"
+          "/auth/|/key/|"
+          "^rtmps?:\\/\\/|"
+          "^wss?:\\/\\/.*\\.flv"
+        ")";
+        re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
     });
     return [re numberOfMatchesInString:u options:0 range:NSMakeRange(0, u.length)] > 0;
 }
@@ -83,16 +104,16 @@ static NSString *AS_NowString(void) {
 
 #pragma mark - State
 
-static BOOL gAS_Enabled = YES;              // 你说不需要开关：默认一直开
+static BOOL gAS_Enabled = YES;              // 不需要开关：默认一直开
 static BOOL gAS_EnteredTargetPage = NO;     // 进入目标 host 后置为 YES
-static NSMutableSet<NSString *> *gAS_Once = nil; // 去重
+static NSMutableSet<NSString *> *gAS_Once = nil;
 
 static BOOL AS_Once(NSString *key) {
     if (!key.length) return NO;
     if (!gAS_Once) gAS_Once = [NSMutableSet set];
     if ([gAS_Once containsObject:key]) return NO;
     [gAS_Once addObject:key];
-    if (gAS_Once.count > 500) [gAS_Once removeAllObjects];
+    if (gAS_Once.count > 800) [gAS_Once removeAllObjects];
     return YES;
 }
 
@@ -105,7 +126,6 @@ static UIViewController *AS_TopVC(void) {
     return vc;
 }
 
-// 弹窗节流：避免短时间大量弹窗卡死
 static NSTimeInterval gAS_LastAlertTS = 0;
 
 static void AS_ShowAlert(NSString *title, NSString *message, BOOL allowCopy) {
@@ -115,7 +135,7 @@ static void AS_ShowAlert(NSString *title, NSString *message, BOOL allowCopy) {
         if (!vc) return;
 
         NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-        if (now - gAS_LastAlertTS < 0.6) return; // 0.6s 内只弹一次
+        if (now - gAS_LastAlertTS < 0.5) return; // 0.5s 内只弹一次
         gAS_LastAlertTS = now;
 
         if (vc.presentedViewController && [vc.presentedViewController isKindOfClass:[UIAlertController class]]) return;
@@ -143,7 +163,6 @@ static void AS_ReportToServer(NSString *type, NSString *payload) {
     if (!payload.length) return;
     if (!kPushRawEndpoint.length) return;
 
-    // 走 raw JSON 上报
     NSURL *url = [NSURL URLWithString:kPushRawEndpoint];
     if (!url) return;
 
@@ -159,12 +178,9 @@ static void AS_ReportToServer(NSString *type, NSString *payload) {
         @"data": payload ?: @""
     };
 
-    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    req.HTTPBody = data;
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
 
-    NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
-        // 默认不弹窗，避免干扰
-    }];
+    NSURLSessionDataTask *t = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}];
     [t resume];
 #else
     (void)type; (void)payload;
@@ -173,10 +189,6 @@ static void AS_ReportToServer(NSString *type, NSString *payload) {
 
 #pragma mark - Core capture decision
 
-// 关键点：微信 H5 的“真实直播 m3u8/flv”经常走 CDN，不一定是 ced.wtyibxc.cn。
-// 所以：进入目标页面后：
-// - 如果 AS_OnlyMediaURLs=YES：媒体 URL 不限制 host（全抓）。
-// - 如果 AS_OnlyMediaURLs=NO：非媒体只抓目标 host；媒体依旧全抓（防止漏 CDN）。
 static BOOL AS_ShouldCaptureURL(NSURL *url) {
     if (!gAS_Enabled || !url) return NO;
     if (AS_IsPushURL(url)) return NO;
@@ -188,29 +200,32 @@ static BOOL AS_ShouldCaptureURL(NSURL *url) {
     if (AS_OnlyMediaURLs) {
         return isMedia;
     } else {
-        if (isMedia) return YES;
+        if (isMedia) return YES; // 命中(媒体/鉴权参数) 不限制 host
         return AS_HostMatched(url.host ?: @"");
     }
 }
 
-#pragma mark - Response scan (从 JSON/文本里提取 m3u8/flv 等)
+#pragma mark - Response scan
 
 static void AS_ScanResponseForMedia(NSURL *reqURL, NSData *data, NSString *srcTag) {
     if (!gAS_EnteredTargetPage) return;
     if (!data.length) return;
-
-    // 只扫文本类，且限制大小
-    if (data.length > 300 * 1024) return;
+    if (data.length > 400 * 1024) return;
 
     NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!s.length) return;
 
-    // 先快速判断是否可能包含媒体关键字（减少正则开销）
-    if ([s rangeOfString:@"m3u8" options:NSCaseInsensitiveSearch].location == NSNotFound &&
-        [s rangeOfString:@"flv"  options:NSCaseInsensitiveSearch].location == NSNotFound &&
-        [s rangeOfString:@"rtmp" options:NSCaseInsensitiveSearch].location == NSNotFound) {
-        return;
-    }
+    BOOL maybe =
+        ([s rangeOfString:@"m3u8" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@".ts" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"auth" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"auth_key" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"key=" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"token" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"flv" options:NSCaseInsensitiveSearch].location != NSNotFound) ||
+        ([s rangeOfString:@"rtmp" options:NSCaseInsensitiveSearch].location != NSNotFound);
+
+    if (!maybe) return;
 
     static NSRegularExpression *urlRe = nil;
     static dispatch_once_t onceToken;
@@ -228,11 +243,11 @@ static void AS_ScanResponseForMedia(NSURL *reqURL, NSData *data, NSString *srcTa
         NSString *key = [NSString stringWithFormat:@"RESP:%@", u];
         if (!AS_Once(key)) continue;
 
-        NSString *line = [NSString stringWithFormat:@"FOUND_IN_RESPONSE(%@)\nREQ=%@\nMEDIA=%@",
+        NSString *line = [NSString stringWithFormat:@"FOUND_IN_RESPONSE(%@)\nREQ=%@\nHIT=%@",
                           srcTag ?: @"resp", reqURL.absoluteString ?: @"", u];
         NSLog(@"[AliSniffer] %@", line);
         AS_ReportToServer(@"FOUND_MEDIA", line);
-        AS_ShowAlert(@"AliSniffer 找到媒体URL", line, YES);
+        AS_ShowAlert(@"AliSniffer 命中(响应)", line, YES);
     }
 }
 
@@ -253,18 +268,16 @@ static id swz_dataTaskWithRequest_completion(id self, SEL _cmd, NSURLRequest *re
 
     void (^wrapped)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
         @try {
-            // 1) 直接抓“请求 URL”（当 AS_OnlyMediaURLs=NO 你会看到各种接口）
             if (request.URL && AS_ShouldCaptureURL(request.URL)) {
-                NSString *line = [NSString stringWithFormat:@"REQ %@\n%@", request.HTTPMethod ?: @"GET", request.URL.absoluteString ?: @""];
-                NSString *key = [NSString stringWithFormat:@"REQ:%@", request.URL.absoluteString ?: @""];
+                NSString *u = request.URL.absoluteString ?: @"";
+                NSString *key = [NSString stringWithFormat:@"REQ:%@", u];
                 if (AS_Once(key)) {
+                    NSString *line = [NSString stringWithFormat:@"REQ %@\n%@", request.HTTPMethod ?: @"GET", u];
                     NSLog(@"[AliSniffer] %@", line);
                     AS_ReportToServer(@"REQ_URL", line);
                     AS_ShowAlert(@"AliSniffer 请求", line, YES);
                 }
             }
-
-            // 2) 扫描响应体：从 JSON/文本里“提取 m3u8/flv/rtmp”
             AS_ScanResponseForMedia(request.URL, data, @"NSURLSession");
         } @catch(...) {}
 
@@ -281,15 +294,14 @@ static void swz_task_resume(id self, SEL _cmd) {
         @try { r = [self respondsToSelector:@selector(currentRequest)] ? [self performSelector:@selector(currentRequest)] : nil; } @catch(...) {}
 
         if (r.URL && AS_ShouldCaptureURL(r.URL)) {
-            // 只做“媒体 URL”弹窗（避免重复）
             NSString *u = r.URL.absoluteString ?: @"";
             if (AS_IsMediaURL(u)) {
                 NSString *key = [NSString stringWithFormat:@"MEDIA_REQ:%@", u];
                 if (AS_Once(key)) {
-                    NSString *line = [NSString stringWithFormat:@"MEDIA_REQ\n%@", u];
+                    NSString *line = [NSString stringWithFormat:@"HIT(MEDIA_REQ)\n%@", u];
                     NSLog(@"[AliSniffer] %@", line);
                     AS_ReportToServer(@"MEDIA_REQ", line);
-                    AS_ShowAlert(@"AliSniffer 媒体请求", line, YES);
+                    AS_ShowAlert(@"AliSniffer 命中(媒体请求)", line, YES);
                 }
             }
         }
@@ -310,7 +322,7 @@ static void AS_InstallSessionHooks(void) {
         Class T = NSClassFromString(@"NSURLSessionTask");
         if (T) AS_Swizzle(T, @selector(resume), (IMP)swz_task_resume, (IMP *)&orig_task_resume);
 
-        AS_ShowAlert(@"AliSniffer", @"注入成功（NSURLSession/WKWebView Hook 已安装）", NO);
+        AS_ShowAlert(@"AliSniffer", @"注入成功（开始等待进入目标页面…）", NO);
         NSLog(@"[AliSniffer] hooks installed");
     }
 }
@@ -335,10 +347,10 @@ static void AS_ObserveAccessLog(AVPlayerItem *item) {
                 if (AS_IsMediaURL(uri)) {
                     NSString *key = [NSString stringWithFormat:@"AV:%@", uri];
                     if (!AS_Once(key)) return;
-                    NSString *line = [NSString stringWithFormat:@"AVAccessLog URI\n%@", uri];
+                    NSString *line = [NSString stringWithFormat:@"HIT(AVAccessLog)\n%@", uri];
                     NSLog(@"[AliSniffer] %@", line);
                     AS_ReportToServer(@"AV_URI", line);
-                    AS_ShowAlert(@"AliSniffer AVPlayer", line, YES);
+                    AS_ShowAlert(@"AliSniffer 命中(AVPlayer)", line, YES);
                 }
             } @catch(...) {}
         }];
@@ -377,17 +389,15 @@ static void AS_InstallAVHooks(void) {
     NSString *t = d[@"t"];
     NSString *u = d[@"u"];
     if (!u.length) return;
-
-    // 只要进入目标页面后，JS 也会把 performance entries/fetch/xhr 抛出来
     if (!gAS_EnteredTargetPage) return;
 
     if (AS_IsMediaURL(u)) {
         NSString *key = [NSString stringWithFormat:@"WK:%@", u];
         if (!AS_Once(key)) return;
-        NSString *line = [NSString stringWithFormat:@"WK(%@)\n%@", t ?: @"res", u];
+        NSString *line = [NSString stringWithFormat:@"HIT(WK-%@)\n%@", t ?: @"res", u];
         NSLog(@"[AliSniffer] %@", line);
-        AS_ReportToServer(@"WK_MEDIA", line);
-        AS_ShowAlert(@"AliSniffer WKWebView", line, YES);
+        AS_ReportToServer(@"WK_HIT", line);
+        AS_ShowAlert(@"AliSniffer 命中(WKWebView)", line, YES);
     }
 }
 @end
@@ -414,11 +424,14 @@ static void AS_AddWKScripts(WKWebViewConfiguration *cfg) {
       "var _push=history.pushState;history.pushState=function(){var r=_push.apply(this,arguments);try{if(matchHost())post('nav',location.href);}catch(e){}return r;};"
       "window.addEventListener('popstate',function(){try{if(matchHost())post('nav',location.href);}catch(e){}});"
       "if(window.fetch){var _f=window.fetch;window.fetch=function(){try{post('fetch_req',arguments[0]);}catch(e){}"
+
         "return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)post('fetch_res',r.url);}catch(e){}return r;});};}"
       "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{post('xhr_open',u);}catch(e){}return o.apply(this,arguments);};}"
       "setInterval(function(){try{var es=performance.getEntriesByType('resource')||[];"
+
         "for(var i=Math.max(0,es.length-30);i<es.length;i++){var e=es[i];if(e&&e.name)post('perf',e.name);}"
-      "}catch(e){}},1200);"
+
+      "}catch(e){}},1100);"
      "}catch(e){}})();", targets];
 
     WKUserScript *sc = [[WKUserScript alloc] initWithSource:js
@@ -439,7 +452,7 @@ static void swz_wk_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *req) {
         NSString *host = req.URL.host ?: @"";
         if (AS_HostMatched(host) && !gAS_EnteredTargetPage) {
             gAS_EnteredTargetPage = YES;
-            NSString *msg = [NSString stringWithFormat:@"进入页面：%@\n开始抓取：\n- 媒体URL不限制host（防止CDN漏抓）\n- 并会扫描接口响应，自动提取 m3u8/flv/rtmp", host];
+            NSString *msg = [NSString stringWithFormat:@"进入页面：%@\n开始抓取：\n- 命中(媒体/鉴权参数) 不限制 host（防止 CDN 漏抓）\n- 也会扫描接口响应提取 m3u8/ts/带 key/auth 的 URL", host];
             AS_ReportToServer(@"ENTER_PAGE", msg);
             AS_ShowAlert(@"AliSniffer", msg, NO);
         }
