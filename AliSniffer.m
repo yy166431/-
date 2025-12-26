@@ -70,7 +70,7 @@ static void AS_ShowToast(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = AS_TopVC();
         if (!vc) return;
-        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(0,0,0,0)];
         lab.text = text ?: @"";
         lab.numberOfLines = 0;
         lab.font = [UIFont systemFontOfSize:13];
@@ -176,7 +176,7 @@ static void AS_PushCaptured(NSString *line) {
     if (!gAS_Button) return;
     CGPoint t = [g translationInView:gAS_Button.superview];
     gAS_Button.center = CGPointMake(gAS_Button.center.x + t.x, gAS_Button.center.y + t.y);
-    [g setTranslation:CGPointZero inView:gAS_Button.superview];
+    [g setTranslation:CGPointMake(0,0) inView:gAS_Button.superview];
 }
 @end
 
