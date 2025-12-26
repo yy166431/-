@@ -20,7 +20,7 @@ static NSArray<NSString *> *AS_TargetHosts(void) {
 }
 
 // 是否只抓“媒体相关”URL；想抓完整请求可改成 NO
-static BOOL AS_OnlyMediaURLs = YES;
+static BOOL AS_OnlyMediaURLs = NO;
 
 // 媒体 URL 识别：m3u8/mpd/m4s/ts/mp4/flv/rtmp…（可自行增删）
 static BOOL AS_IsMediaURL(NSString *u) {
